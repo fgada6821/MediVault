@@ -8,6 +8,11 @@
 (define-constant ERR-CLAIM-ALREADY-PROCESSED (err u107))
 (define-constant ERR-INVALID-CLAIM-AMOUNT (err u108))
 (define-constant ERR-PROVIDER-NOT-VERIFIED (err u109))
+(define-constant ERR-APPOINTMENT-NOT-FOUND (err u110))
+(define-constant ERR-SLOT-NOT-AVAILABLE (err u111))
+(define-constant ERR-INVALID-TIME-SLOT (err u112))
+(define-constant ERR-APPOINTMENT-ALREADY-CONFIRMED (err u113))
+(define-constant ERR-CANNOT-CANCEL-PAST-APPOINTMENT (err u114))
 
 (define-data-var contract-owner principal tx-sender)
 
@@ -97,8 +102,40 @@
   }
 )
 
+(define-map DoctorAvailability
+  {
+    doctor-id: principal,
+    time-slot: uint
+  }
+  {
+    date: uint,
+    start-time: uint,
+    end-time: uint,
+    status: uint,
+    appointment-id: uint
+  }
+)
+
+(define-map Appointments
+  { appointment-id: uint }
+  {
+    patient-id: principal,
+    doctor-id: principal,
+    date: uint,
+    start-time: uint,
+    end-time: uint,
+    purpose: (string-ascii 128),
+    status: uint,
+    created-at: uint,
+    confirmed-at: uint,
+    completed-at: uint,
+    notes: (string-ascii 256)
+  }
+)
+
 (define-data-var record-counter uint u0)
 (define-data-var claim-counter uint u0)
+(define-data-var appointment-counter uint u0)
 
 (define-public (register-patient (name (string-ascii 64)) (dob uint) (blood-type (string-ascii 3)) (emergency-contact (string-ascii 64)))
   (let ((patient-data { patient-id: tx-sender }))
@@ -297,3 +334,128 @@
     (if (is-some claim)
       (some (get status (unwrap-panic claim)))
       none)))
+
+(define-public (set-doctor-availability 
+    (date uint)
+    (start-time uint)
+    (end-time uint))
+  (let ((slot-id (+ (* date u10000) start-time)))
+    (asserts! (is-some (map-get? DoctorRegistry { doctor-id: tx-sender })) ERR-NOT-DOCTOR)
+    (asserts! (< start-time end-time) ERR-INVALID-TIME-SLOT)
+    (asserts! (>= date stacks-block-height) ERR-INVALID-TIME-SLOT)
+    (ok (map-set DoctorAvailability
+      {
+        doctor-id: tx-sender,
+        time-slot: slot-id
+      }
+      {
+        date: date,
+        start-time: start-time,
+        end-time: end-time,
+        status: u1,
+        appointment-id: u0
+      }))))
+
+(define-public (request-appointment 
+    (doctor-id principal)
+    (date uint)
+    (start-time uint)
+    (end-time uint)
+    (purpose (string-ascii 128)))
+  (let 
+    ((slot-id (+ (* date u10000) start-time))
+     (current-appointment-id (var-get appointment-counter))
+     (availability (map-get? DoctorAvailability { doctor-id: doctor-id, time-slot: slot-id })))
+    (asserts! (is-some (map-get? Patients { patient-id: tx-sender })) ERR-NO-PATIENT)
+    (asserts! (is-some (map-get? DoctorRegistry { doctor-id: doctor-id })) ERR-NOT-DOCTOR)
+    (asserts! (is-some availability) ERR-SLOT-NOT-AVAILABLE)
+    (asserts! (is-eq (get status (unwrap-panic availability)) u1) ERR-SLOT-NOT-AVAILABLE)
+    (asserts! (>= date stacks-block-height) ERR-INVALID-TIME-SLOT)
+    (var-set appointment-counter (+ current-appointment-id u1))
+    (map-set DoctorAvailability
+      { doctor-id: doctor-id, time-slot: slot-id }
+      (merge (unwrap-panic availability) { status: u2, appointment-id: current-appointment-id }))
+    (ok (map-set Appointments
+      { appointment-id: current-appointment-id }
+      {
+        patient-id: tx-sender,
+        doctor-id: doctor-id,
+        date: date,
+        start-time: start-time,
+        end-time: end-time,
+        purpose: purpose,
+        status: u1,
+        created-at: stacks-block-height,
+        confirmed-at: u0,
+        completed-at: u0,
+        notes: ""
+      }))))
+
+(define-public (confirm-appointment (appointment-id uint))
+  (let ((appointment (unwrap! (map-get? Appointments { appointment-id: appointment-id }) ERR-APPOINTMENT-NOT-FOUND)))
+    (asserts! (is-eq (get doctor-id appointment) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status appointment) u1) ERR-APPOINTMENT-ALREADY-CONFIRMED)
+    (ok (map-set Appointments
+      { appointment-id: appointment-id }
+      (merge appointment
+        {
+          status: u2,
+          confirmed-at: stacks-block-height
+        })))))
+
+(define-public (cancel-appointment (appointment-id uint))
+  (let ((appointment (unwrap! (map-get? Appointments { appointment-id: appointment-id }) ERR-APPOINTMENT-NOT-FOUND)))
+    (asserts! (or 
+      (is-eq (get patient-id appointment) tx-sender)
+      (is-eq (get doctor-id appointment) tx-sender)) ERR-NOT-AUTHORIZED)
+    (asserts! (>= (get date appointment) stacks-block-height) ERR-CANNOT-CANCEL-PAST-APPOINTMENT)
+    (asserts! (< (get status appointment) u3) ERR-APPOINTMENT-ALREADY-CONFIRMED)
+    (let ((slot-id (+ (* (get date appointment) u10000) (get start-time appointment))))
+      (map-set DoctorAvailability
+        { doctor-id: (get doctor-id appointment), time-slot: slot-id }
+        (merge (unwrap-panic (map-get? DoctorAvailability { doctor-id: (get doctor-id appointment), time-slot: slot-id }))
+          { status: u1, appointment-id: u0 }))
+      (ok (map-set Appointments
+        { appointment-id: appointment-id }
+        (merge appointment { status: u4 }))))))
+
+(define-public (complete-appointment (appointment-id uint) (notes (string-ascii 256)))
+  (let ((appointment (unwrap! (map-get? Appointments { appointment-id: appointment-id }) ERR-APPOINTMENT-NOT-FOUND)))
+    (asserts! (is-eq (get doctor-id appointment) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status appointment) u2) ERR-APPOINTMENT-ALREADY-CONFIRMED)
+    (ok (map-set Appointments
+      { appointment-id: appointment-id }
+      (merge appointment
+        {
+          status: u3,
+          completed-at: stacks-block-height,
+          notes: notes
+        })))))
+
+(define-public (mark-no-show (appointment-id uint))
+  (let ((appointment (unwrap! (map-get? Appointments { appointment-id: appointment-id }) ERR-APPOINTMENT-NOT-FOUND)))
+    (asserts! (is-eq (get doctor-id appointment) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status appointment) u2) ERR-APPOINTMENT-ALREADY-CONFIRMED)
+    (asserts! (> stacks-block-height (get date appointment)) ERR-INVALID-TIME-SLOT)
+    (ok (map-set Appointments
+      { appointment-id: appointment-id }
+      (merge appointment { status: u5 })))))
+
+(define-read-only (get-doctor-availability (doctor-id principal) (date uint) (start-time uint))
+  (let ((slot-id (+ (* date u10000) start-time)))
+    (map-get? DoctorAvailability { doctor-id: doctor-id, time-slot: slot-id })))
+
+(define-read-only (get-appointment (appointment-id uint))
+  (map-get? Appointments { appointment-id: appointment-id }))
+
+(define-read-only (get-appointment-status (appointment-id uint))
+  (let ((appointment (map-get? Appointments { appointment-id: appointment-id })))
+    (if (is-some appointment)
+      (some (get status (unwrap-panic appointment)))
+      none)))
+
+
+
+
+
+
